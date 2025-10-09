@@ -1,0 +1,154 @@
+pipeline {
+    agent any
+
+    environment {
+        GIT_URL = "https://github.com/opstree/spring3hibernate.git"
+    }
+
+    parameters {
+        string(name: 'BRANCH', defaultValue: 'master', description: 'Branch name to build')
+        choice(name: 'ENV', choices: ['dev', 'stage', 'prod'], description: 'Select environment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip unit tests?')
+        booleanParam(name: 'SKIP_QUALITY', defaultValue: false, description: 'Skip code quality checks?')
+        booleanParam(name: 'SKIP_COVERAGE', defaultValue: false, description: 'Skip code coverage analysis?')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out code from ${params.BRANCH}"
+                git branch: "${params.BRANCH}", url: "${env.GIT_URL}"
+            }
+        }
+
+        stage('Verify Environment') {
+            steps {
+                sh 'mvn --version'
+                sh 'java --version'
+            }
+        }
+
+        stage('Compile') {
+            steps {
+                sh 'mvn clean compile'
+            }
+        }
+
+        stage('Parallel Scans') {
+            parallel {
+                stage('Code Stability - JUnit') {
+                    when {
+                        expression { return !params.SKIP_TESTS }
+                    }
+                    steps {
+                        echo "Running JUnit tests..."
+                        sh 'mvn test'
+                        junit '**/target/surefire-reports/*.xml'
+                    }
+                }
+
+                stage('Code Quality - FindBugs + Checkstyle + OWASP') {
+                    when {
+                        expression { return !params.SKIP_QUALITY }
+                    }
+                    steps {
+                        echo "Running Code Quality Scans..."
+                        sh '''
+                            mvn findbugs:findbugs checkstyle:checkstyle dependency-check:check
+                        '''
+                        publishHTML(target: [
+                            reportDir: 'target/findbugs',
+                            reportFiles: 'findbugs.xml',
+                            reportName: 'FindBugs Report',
+                            keepAll: true
+                        ])
+                        publishHTML(target: [
+                            reportDir: 'target',
+                            reportFiles: 'checkstyle-result.xml',
+                            reportName: 'Checkstyle Report',
+                            keepAll: true
+                        ])
+                        publishHTML(target: [
+                            reportDir: 'target',
+                            reportFiles: 'dependency-check-report.html',
+                            reportName: 'OWASP Report',
+                            keepAll: true
+                        ])
+                    }
+                }
+
+                stage('Code Coverage - Cobertura') {
+                    when {
+                        expression { return !params.SKIP_COVERAGE }
+                    }
+                    steps {
+                        echo "Running Cobertura code coverage..."
+                        sh 'mvn cobertura:cobertura'
+                        publishHTML(target: [
+                            reportDir: 'target/site/cobertura',
+                            reportFiles: 'index.html',
+                            reportName: 'Cobertura Coverage Report',
+                            keepAll: true
+                        ])
+                    }
+                }
+            }
+        }
+
+        stage('Package Artifacts') {
+            steps {
+                echo "Packaging application..."
+                sh 'mvn package -DskipTests'
+                archiveArtifacts artifacts: 'target/*.war', fingerprint: true
+            }
+        }
+
+        stage('Approval Before Publish') {
+            steps {
+                script {
+                    def userInput = input(
+                        id: 'Approval',
+                        message: 'Do you approve deployment/publication?',
+                        parameters: [choice(choices: ['Yes', 'No'], description: 'Approve to publish?', name: 'APPROVE')]
+                    )
+                    if (userInput == 'No') {
+                        error("Publication not approved. Pipeline stopped.")
+                    }
+                }
+            }
+        }
+
+        stage('Publish Artifacts') {
+            steps {
+                echo "Publishing artifacts to repository..."
+                sh 'mvn deploy -DskipTests'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Build succeeded!"
+            slackSend(channel: '#jenkins', color: 'good', message: "Build SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}")
+            emailext(
+                to: 'dev-team@example.com',
+                subject: "SUCCESS: Jenkins Build ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: "Good news! The build for ${env.JOB_NAME} succeeded.\nBuild URL: ${env.BUILD_URL}"
+            )
+        }
+
+        failure {
+            echo "❌ Build failed!"
+            slackSend(channel: '#jenkins', color: 'danger', message: "Build FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}")
+            emailext(
+                to: 'dev-team@example.com',
+                subject: "FAILED: Jenkins Build ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: "The build for ${env.JOB_NAME} failed.\nCheck console output: ${env.BUILD_URL}"
+            )
+        }
+
+        always {
+            echo "Pipeline execution complete."
+        }
+    }
+}
