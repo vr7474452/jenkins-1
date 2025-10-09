@@ -1,0 +1,178 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk11'
+        maven 'maven3'
+    }
+
+    environment {
+        GIT_URL = "https://github.com/opstree/spring3hibernate.git"
+    }
+
+    parameters {
+        string(name: 'BRANCH', defaultValue: 'master', description: 'Branch name to build')
+        choice(name: 'ENV', choices: ['dev', 'stage', 'prod'], description: 'Select environment')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip unit tests?')
+        booleanParam(name: 'SKIP_QUALITY', defaultValue: false, description: 'Skip code quality checks?')
+        booleanParam(name: 'SKIP_COVERAGE', defaultValue: false, description: 'Skip code coverage analysis?')
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "Checking out branch: ${params.BRANCH}"
+                git branch: "${params.BRANCH}", url: "${env.GIT_URL}"
+            }
+        }
+
+        stage('Verify Environment') {
+            steps {
+                sh 'mvn --version'
+                sh 'java --version'
+            }
+        }
+
+        stage('Compile') {
+            steps {
+                echo "Compiling project..."
+                sh 'mvn clean compile -DskipTests'
+            }
+        }
+
+        stage('Parallel Analysis') {
+            parallel {
+
+                stage('Code Stability - JUnit') {
+                    when {
+                        expression { return !params.SKIP_TESTS }
+                    }
+                    steps {
+                        echo "Running unit tests..."
+                        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                            sh 'mvn test'
+                        }
+                        junit allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml'
+                    }
+                }
+
+                stage('Code Quality - FindBugs + Checkstyle + OWASP') {
+                    when {
+                        expression { return !params.SKIP_QUALITY }
+                    }
+                    steps {
+                        echo "Running code quality analysis..."
+                        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                            sh '''
+                                mvn findbugs:findbugs checkstyle:checkstyle dependency-check:check
+                            '''
+                        }
+                    }
+                }
+
+                stage('Code Coverage - Cobertura') {
+                    when {
+                        expression { return !params.SKIP_COVERAGE }
+                    }
+                    steps {
+                        echo "Generating code coverage report..."
+                        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                            sh 'mvn cobertura:cobertura'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Publish Reports') {
+            steps {
+                echo "Publishing all reports together (even if some failed)..."
+
+                // Publish JUnit test results
+                junit allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml'
+
+                // Publish FindBugs, Checkstyle, and OWASP reports
+                publishHTML(target: [
+                    reportDir: 'target/site',
+                    reportFiles: 'findbugs.html',
+                    reportName: 'FindBugs Report',
+                    keepAll: true
+                ])
+                publishHTML(target: [
+                    reportDir: 'target/site',
+                    reportFiles: 'checkstyle.html',
+                    reportName: 'Checkstyle Report',
+                    keepAll: true
+                ])
+                publishHTML(target: [
+                    reportDir: 'target',
+                    reportFiles: 'dependency-check-report.html',
+                    reportName: 'OWASP Dependency Report',
+                    keepAll: true
+                ])
+
+                // Publish Cobertura coverage report
+                publishHTML(target: [
+                    reportDir: 'target/site/cobertura',
+                    reportFiles: 'index.html',
+                    reportName: 'Cobertura Code Coverage',
+                    keepAll: true
+                ])
+            }
+        }
+
+        stage('Approval Before Packaging') {
+            steps {
+                script {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        def userInput = input(
+                            id: 'Approval',
+                            message: 'Do you approve to proceed with artifact packaging?',
+                            parameters: [
+                                choice(name: 'APPROVE', choices: ['Yes', 'No'], description: 'Approve packaging?')
+                            ]
+                        )
+                        if (userInput == 'No') {
+                            error("Packaging not approved. Pipeline stopped.")
+                        } else {
+                            echo "Approval granted. Proceeding with packaging..."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Package Artifact') {
+            steps {
+                echo "Packaging the artifact..."
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    sh 'mvn clean package -DskipTests'
+                }
+                archiveArtifacts artifacts: 'target/*.war', fingerprint: true, allowEmptyArchive: true
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline execution complete for ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+        }
+        success {
+            echo "✅ All reports and artifact generated successfully."
+        }
+        unstable {
+            echo "⚠ Some tests or checks failed, but reports and artifact were generated."
+        }
+        failure {
+            echo "❌ Pipeline failed, but reports were still published."
+        }
+    }
+}
